@@ -1,0 +1,118 @@
+x-app-environment: &app-environment
+  APP_NAME: ${APP_NAME:-StreamHub}
+  APP_ENV: ${APP_ENV:-development}
+  APP_SECRET_KEY: ${APP_SECRET_KEY:-local-development-secret-change-before-production}
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-10080}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-streamhub}:${POSTGRES_PASSWORD:-streamhub}@db:5432/streamhub}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+  S3_BUCKET: ${S3_BUCKET:-streamhub-media}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-streamhubadmin}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-change-this-rustfs-secret}
+  MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-2147483648}
+  ALLOWED_VIDEO_EXTENSIONS: ${ALLOWED_VIDEO_EXTENSIONS:-.mp4,.mov,.mkv,.webm}
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: streamhub
+      POSTGRES_USER: ${POSTGRES_USER:-streamhub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streamhub}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streamhub -d streamhub"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # RustFS is an S3-compatible replacement for the no-longer-public MinIO image.
+  # Keep the service name "minio" so the existing S3_ENDPOINT_URL remains valid.
+  minio:
+    image: rustfs/rustfs:latest
+    restart: unless-stopped
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-streamhubadmin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-change-this-rustfs-secret}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: error
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "sh", "-ec", "curl -fsS http://127.0.0.1:9000/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment: *app-environment
+    # Start the API as soon as migrations finish. Demo media generation is
+    # intentionally isolated in the one-shot `seed` service below; otherwise
+    # FFmpeg/S3 uploads can delay Uvicorn long enough to fail the API healthcheck.
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 4s
+      retries: 30
+      start_period: 45s
+
+  # Seed runs only after the API is healthy. It can take longer on the first
+  # start because it creates demo thumbnails/videos and uploads them to RustFS.
+  seed:
+    build: .
+    restart: "no"
+    environment: *app-environment
+    command: ["python", "-m", "app.seed"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+  worker:
+    build: .
+    restart: unless-stopped
+    environment: *app-environment
+    command: celery -A app.tasks.celery_app.celery_app worker --loglevel=INFO --concurrency=2
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
